@@ -1,0 +1,613 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<title>Labirinto 3D Simples</title>
+<style>
+  html, body { margin:0; padding:0; overflow:hidden; background:#000; font-family: Arial, sans-serif; }
+  canvas { display:block; }
+
+  #hud {
+    position:fixed; top:10px; left:10px; color:#fff;
+    font-size:18px; text-shadow:1px 1px 2px #000; z-index:5;
+  }
+  #msg {
+    position:fixed; bottom:10px; left:50%; transform:translateX(-50%);
+    color:#fff; font-size:14px; text-shadow:1px 1px 2px #000; z-index:5;
+    text-align:center;
+  }
+  #endScreen {
+    position:fixed; inset:0; display:none; z-index:10;
+    background:rgba(0,0,0,0.85); color:#fff;
+    flex-direction:column; align-items:center; justify-content:center;
+  }
+  #endScreen h1 { font-size:36px; margin-bottom:10px; }
+  #endScreen button {
+    margin-top:20px; padding:10px 24px; font-size:16px; cursor:pointer;
+    background:#2ecc71; border:none; border-radius:6px; color:#000; font-weight:bold;
+  }
+
+  #minimapa {
+    position:fixed; top:10px; right:10px; z-index:5;
+    border:2px solid #fff; border-radius:4px; background:rgba(0,0,0,0.6);
+  }
+</style>
+</head>
+<body>
+
+<div id="hud">
+  Pontos: <span id="score">0</span> | Vidas: <span id="lives">3</span>
+</div>
+<div id="msg">Setas / WASD = mover &nbsp;|&nbsp; Mouse arrastando = olhar &nbsp;|&nbsp; Fuja do inimigo vermelho!</div>
+
+<canvas id="minimapa" width="150" height="150"></canvas>
+
+<div id="endScreen">
+  <h1 id="endTitle">Fim de jogo</h1>
+  <p>Pontos: <span id="finalScore">0</span></p>
+  <button onclick="location.reload()">Jogar de novo</button>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+/* ===========================================================
+   LABIRINTO 3D SIMPLES
+   - Cenario: labirinto gerado automaticamente
+   - Movimentacao: WASD/setas + mouse (arrastar para olhar)
+   - IA de perseguicao: inimigo persegue o jogador (BFS no grid)
+   - Hit score: pontos por moedas + vidas ao ser pego
+   - Texturizacao: cores/textura simples nas paredes e piso
+   =========================================================== */
+
+// ---------- CONFIGURACOES ----------
+const TAM = 11;            // tamanho do labirinto (numero impar)
+const CEL = 4;              // tamanho de cada celula no mundo 3D
+const ALTURA_PAREDE = 3;
+const VEL_JOGADOR = 5;
+const VEL_INIMIGO = 2.3;
+const DIST_PEGAR = 0.9;
+const TOTAL_MOEDAS = 10;
+const VIDAS_MAX = 3;
+
+let cena, camera, renderer, relogio;
+let labirinto;
+let jogadorX, jogadorZ, jogadorAngulo = Math.PI, jogadorInclinacao = 0;
+let teclas = {};
+let mouseApertado = false;
+let ultimoMouseX = 0, ultimoMouseY = 0;
+let moedas = [];
+let saidaMesh, saidaCelula;
+let inimigo = { mesh:null, celula:null, caminho:[], temporizador:0 };
+let pontos = 0, vidas = VIDAS_MAX;
+let jogoAtivo = true;
+let semColisaoTempo = 0;
+
+// ---------- GERAR LABIRINTO (busca em profundidade) ----------
+function gerarLabirinto(tamanho) {
+  const grade = [];
+  for (let y=0;y<tamanho;y++){
+    grade.push([]);
+    for (let x=0;x<tamanho;x++){
+      grade[y].push({N:false,S:false,L:false,O:false,visitado:false});
+    }
+  }
+  const pilha = [[0,0]];
+  grade[0][0].visitado = true;
+
+  const direcoes = [
+    {dx:0,dy:-1,este:'N',oposto:'S'},
+    {dx:0,dy:1, este:'S',oposto:'N'},
+    {dx:1,dy:0, este:'L',oposto:'O'},
+    {dx:-1,dy:0,este:'O',oposto:'L'}
+  ];
+
+  while (pilha.length) {
+    const [x,y] = pilha[pilha.length-1];
+    const opcoes = direcoes.filter(d=>{
+      const nx=x+d.dx, ny=y+d.dy;
+      return nx>=0 && nx<tamanho && ny>=0 && ny<tamanho && !grade[ny][nx].visitado;
+    });
+    if (opcoes.length===0) { pilha.pop(); continue; }
+    const d = opcoes[Math.floor(Math.random()*opcoes.length)];
+    const nx=x+d.dx, ny=y+d.dy;
+    grade[y][x][d.este] = true;
+    grade[ny][nx][d.oposto] = true;
+    grade[ny][nx].visitado = true;
+    pilha.push([nx,ny]);
+  }
+  return grade;
+}
+
+function celulaParaMundo(cx, cy) {
+  const meio = (TAM*CEL)/2;
+  return { x: cx*CEL - meio + CEL/2, z: cy*CEL - meio + CEL/2 };
+}
+
+function mundoParaCelula(x,z) {
+  const meio = (TAM*CEL)/2;
+  return {
+    cx: Math.round((x + meio - CEL/2)/CEL),
+    cy: Math.round((z + meio - CEL/2)/CEL)
+  };
+}
+
+// ---------- CONSTRUIR CENARIO 3D ----------
+function construirCenario() {
+  // piso (textura simples gerada por canvas)
+  const texCanvas = document.createElement('canvas');
+  texCanvas.width = 64; texCanvas.height = 64;
+  const ctx = texCanvas.getContext('2d');
+  ctx.fillStyle = '#3a3a3a'; ctx.fillRect(0,0,64,64);
+  ctx.strokeStyle = '#222'; ctx.lineWidth = 2;
+  ctx.strokeRect(0,0,64,64);
+  const texPiso = new THREE.CanvasTexture(texCanvas);
+  texPiso.wrapS = texPiso.wrapT = THREE.RepeatWrapping;
+  texPiso.repeat.set(TAM, TAM);
+
+  const matPiso = new THREE.MeshStandardMaterial({ map: texPiso });
+  const totalTam = TAM*CEL;
+  const piso = new THREE.Mesh(new THREE.PlaneGeometry(totalTam, totalTam), matPiso);
+  piso.rotation.x = -Math.PI/2;
+  cena.add(piso);
+
+  // teto simples
+  const matTeto = new THREE.MeshStandardMaterial({ color: 0x111111 });
+  const teto = new THREE.Mesh(new THREE.PlaneGeometry(totalTam, totalTam), matTeto);
+  teto.rotation.x = Math.PI/2;
+  teto.position.y = ALTURA_PAREDE;
+  cena.add(teto);
+
+  // textura da parede
+  const texParedeCanvas = document.createElement('canvas');
+  texParedeCanvas.width = 64; texParedeCanvas.height = 64;
+  const ctxP = texParedeCanvas.getContext('2d');
+  ctxP.fillStyle = '#6b4f3a'; ctxP.fillRect(0,0,64,64);
+  ctxP.strokeStyle = '#4a3526'; ctxP.lineWidth = 3;
+  ctxP.strokeRect(0,0,32,32);
+  ctxP.strokeRect(32,32,32,32);
+  const texParede = new THREE.CanvasTexture(texParedeCanvas);
+  const matParede = new THREE.MeshStandardMaterial({ map: texParede });
+
+  const geoParedeH = new THREE.BoxGeometry(CEL, ALTURA_PAREDE, 0.2);
+  const geoParedeV = new THREE.BoxGeometry(0.2, ALTURA_PAREDE, CEL);
+
+  for (let y=0;y<TAM;y++){
+    for (let x=0;x<TAM;x++){
+      const celula = labirinto[y][x];
+      const {x:wx, z:wz} = celulaParaMundo(x,y);
+
+      if (!celula.N) {
+        const m = new THREE.Mesh(geoParedeH, matParede);
+        m.position.set(wx, ALTURA_PAREDE/2, wz - CEL/2);
+        cena.add(m);
+      }
+      if (!celula.S && y===TAM-1) {
+        const m = new THREE.Mesh(geoParedeH, matParede);
+        m.position.set(wx, ALTURA_PAREDE/2, wz + CEL/2);
+        cena.add(m);
+      }
+      if (!celula.O) {
+        const m = new THREE.Mesh(geoParedeV, matParede);
+        m.position.set(wx - CEL/2, ALTURA_PAREDE/2, wz);
+        cena.add(m);
+      }
+      if (!celula.L && x===TAM-1) {
+        const m = new THREE.Mesh(geoParedeV, matParede);
+        m.position.set(wx + CEL/2, ALTURA_PAREDE/2, wz);
+        cena.add(m);
+      }
+    }
+  }
+
+  // luzes
+  const ambiente = new THREE.AmbientLight(0xffffff, 0.55);
+  cena.add(ambiente);
+  const luzCamera = new THREE.PointLight(0xffffff, 1.0, 12);
+  camera.add(luzCamera);
+}
+
+// ---------- MOEDAS E SAIDA ----------
+function colocarMoedasESaida() {
+  const celulas = [];
+  for (let y=0;y<TAM;y++) for (let x=0;x<TAM;x++) {
+    if (!(x===0 && y===0)) celulas.push({x,y});
+  }
+  for (let i=celulas.length-1;i>0;i--){
+    const j = Math.floor(Math.random()*(i+1));
+    [celulas[i],celulas[j]] = [celulas[j],celulas[i]];
+  }
+
+  // saida = celula mais distante da origem
+  const dist = bfsDistancias(0,0);
+  let melhor = {x:TAM-1,y:TAM-1}, melhorD=-1;
+  for (let y=0;y<TAM;y++) for (let x=0;x<TAM;x++){
+    if (dist[y][x] > melhorD) { melhorD = dist[y][x]; melhor = {x,y}; }
+  }
+  saidaCelula = melhor;
+
+  const geoMoeda = new THREE.CylinderGeometry(0.25,0.25,0.1,12);
+  const matMoeda = new THREE.MeshStandardMaterial({ color:0xffd700, emissive:0x886600 });
+
+  let colocadas = 0;
+  for (const c of celulas) {
+    if (colocadas >= TOTAL_MOEDAS) break;
+    if (c.x===saidaCelula.x && c.y===saidaCelula.y) continue;
+    const {x:wx,z:wz} = celulaParaMundo(c.x,c.y);
+    const moeda = new THREE.Mesh(geoMoeda, matMoeda);
+    moeda.position.set(wx, 1.0, wz);
+    moeda.rotation.x = Math.PI/2;
+    cena.add(moeda);
+    moedas.push(moeda);
+    colocadas++;
+  }
+
+  const {x:ex,z:ez} = celulaParaMundo(saidaCelula.x, saidaCelula.y);
+  const matSaida = new THREE.MeshStandardMaterial({ color:0x00ff66, emissive:0x008833 });
+  saidaMesh = new THREE.Mesh(new THREE.BoxGeometry(0.8,2.5,0.8), matSaida);
+  saidaMesh.position.set(ex, 1.25, ez);
+  cena.add(saidaMesh);
+}
+
+// ---------- BUSCA NO GRID (BFS) PARA A IA ----------
+function vizinhosDe(x,y) {
+  const c = labirinto[y][x];
+  const r = [];
+  if (c.N) r.push([x,y-1]);
+  if (c.S) r.push([x,y+1]);
+  if (c.L) r.push([x+1,y]);
+  if (c.O) r.push([x-1,y]);
+  return r;
+}
+
+function bfsDistancias(sx,sy) {
+  const dist = Array.from({length:TAM},()=>Array(TAM).fill(-1));
+  dist[sy][sx] = 0;
+  const fila = [[sx,sy]];
+  while (fila.length) {
+    const [x,y] = fila.shift();
+    for (const [nx,ny] of vizinhosDe(x,y)) {
+      if (dist[ny][nx]===-1) {
+        dist[ny][nx] = dist[y][x]+1;
+        fila.push([nx,ny]);
+      }
+    }
+  }
+  return dist;
+}
+
+function bfsCaminho(sx,sy,tx,ty) {
+  if (sx===tx && sy===ty) return [];
+  const anterior = Array.from({length:TAM},()=>Array(TAM).fill(null));
+  const visitado = Array.from({length:TAM},()=>Array(TAM).fill(false));
+  visitado[sy][sx] = true;
+  const fila = [[sx,sy]];
+  let achou = false;
+  while (fila.length && !achou) {
+    const [x,y] = fila.shift();
+    for (const [nx,ny] of vizinhosDe(x,y)) {
+      if (!visitado[ny][nx]) {
+        visitado[ny][nx] = true;
+        anterior[ny][nx] = [x,y];
+        if (nx===tx && ny===ty) { achou = true; break; }
+        fila.push([nx,ny]);
+      }
+    }
+  }
+  if (!visitado[ty][tx]) return [];
+  const caminho = [];
+  let atual = [tx,ty];
+  while (atual && !(atual[0]===sx && atual[1]===sy)) {
+    caminho.unshift(atual);
+    atual = anterior[atual[1]][atual[0]];
+  }
+  return caminho;
+}
+
+// ---------- INIMIGO (IA DE PERSEGUICAO) ----------
+function criarInimigo() {
+  const grupo = new THREE.Group();
+  const corpo = new THREE.Mesh(
+    new THREE.ConeGeometry(0.4, 1.4, 8),
+    new THREE.MeshStandardMaterial({ color:0xff0000, emissive:0x660000 })
+  );
+  corpo.position.y = 0.7;
+  grupo.add(corpo);
+
+  // celula inicial: canto oposto ao jogador
+  const inicio = { x: TAM-1, y: TAM-1 };
+  const {x,z} = celulaParaMundo(inicio.x, inicio.y);
+  grupo.position.set(x,0,z);
+
+  cena.add(grupo);
+  inimigo.mesh = grupo;
+  inimigo.celula = inicio;
+}
+
+function atualizarInimigo(dt) {
+  if (!inimigo.mesh) return;
+
+  // recalcula o caminho até o jogador a cada 0.4s (perseguicao constante)
+  inimigo.temporizador -= dt;
+  if (inimigo.temporizador <= 0) {
+    inimigo.temporizador = 0.4;
+    const celJogador = mundoParaCelula(jogadorX, jogadorZ);
+    inimigo.caminho = bfsCaminho(inimigo.celula.x, inimigo.celula.y, celJogador.cx, celJogador.cy);
+  }
+
+  if (inimigo.caminho && inimigo.caminho.length > 0) {
+    const prox = inimigo.caminho[0];
+    const alvo = celulaParaMundo(prox[0], prox[1]);
+    const pos = inimigo.mesh.position;
+    const dx = alvo.x - pos.x, dz = alvo.z - pos.z;
+    const dist = Math.hypot(dx,dz);
+    const passo = VEL_INIMIGO * dt;
+
+    if (dist <= passo) {
+      pos.x = alvo.x; pos.z = alvo.z;
+      inimigo.celula = { x: prox[0], y: prox[1] };
+      inimigo.caminho.shift();
+    } else {
+      pos.x += (dx/dist)*passo;
+      pos.z += (dz/dist)*passo;
+      inimigo.mesh.rotation.y = Math.atan2(dx,dz);
+    }
+  }
+
+  // checa se pegou o jogador
+  const dx = jogadorX - inimigo.mesh.position.x;
+  const dz = jogadorZ - inimigo.mesh.position.z;
+  if (Math.hypot(dx,dz) < DIST_PEGAR && semColisaoTempo<=0) {
+    levouHit();
+  }
+}
+
+// ---------- CONTROLES (TECLADO + MOUSE) ----------
+function configurarControles() {
+  document.addEventListener('keydown', e => teclas[e.key.toLowerCase()] = true);
+  document.addEventListener('keyup', e => teclas[e.key.toLowerCase()] = false);
+
+  // mouse: arrastar para olhar (nao precisa de pointer lock, mais simples e compativel)
+  renderer.domElement.addEventListener('mousedown', e => {
+    mouseApertado = true;
+    ultimoMouseX = e.clientX;
+    ultimoMouseY = e.clientY;
+  });
+  window.addEventListener('mouseup', () => mouseApertado = false);
+  window.addEventListener('mousemove', e => {
+    if (!mouseApertado) return;
+    const dx = e.clientX - ultimoMouseX;
+    const dy = e.clientY - ultimoMouseY;
+    jogadorAngulo -= dx * 0.005;
+    jogadorInclinacao -= dy * 0.005;
+    jogadorInclinacao = Math.max(-1.2, Math.min(1.2, jogadorInclinacao));
+    ultimoMouseX = e.clientX;
+    ultimoMouseY = e.clientY;
+  });
+
+  // suporte a toque (mobile) tambem arrasta pra olhar
+  renderer.domElement.addEventListener('touchstart', e => {
+    mouseApertado = true;
+    ultimoMouseX = e.touches[0].clientX;
+    ultimoMouseY = e.touches[0].clientY;
+  });
+  window.addEventListener('touchend', () => mouseApertado = false);
+  window.addEventListener('touchmove', e => {
+    if (!mouseApertado) return;
+    const dx = e.touches[0].clientX - ultimoMouseX;
+    const dy = e.touches[0].clientY - ultimoMouseY;
+    jogadorAngulo -= dx * 0.005;
+    jogadorInclinacao -= dy * 0.005;
+    jogadorInclinacao = Math.max(-1.2, Math.min(1.2, jogadorInclinacao));
+    ultimoMouseX = e.touches[0].clientX;
+    ultimoMouseY = e.touches[0].clientY;
+  });
+}
+
+// ---------- COLISAO DO JOGADOR COM PAREDES ----------
+function podeAndar(px, pz) {
+  const meio = (TAM*CEL)/2;
+  const fx = px + meio, fz = pz + meio;
+  const cx = Math.floor(fx / CEL);
+  const cy = Math.floor(fz / CEL);
+  if (cx<0||cx>=TAM||cy<0||cy>=TAM) return false;
+
+  const localX = fx - cx*CEL;
+  const localZ = fz - cy*CEL;
+  const raio = 0.3;
+  const celula = labirinto[cy][cx];
+
+  if (!celula.N && localZ - raio < 0) return false;
+  if (!celula.S && localZ + raio > CEL) return false;
+  if (!celula.O && localX - raio < 0) return false;
+  if (!celula.L && localX + raio > CEL) return false;
+  return true;
+}
+
+function atualizarJogador(dt) {
+  let frente = 0, lado = 0;
+  if (teclas['w'] || teclas['arrowup']) frente += 1;
+  if (teclas['s'] || teclas['arrowdown']) frente -= 1;
+  if (teclas['d'] || teclas['arrowright']) lado += 1;
+  if (teclas['a'] || teclas['arrowleft']) lado -= 1;
+
+  if (frente !== 0 || lado !== 0) {
+    const sin = Math.sin(jogadorAngulo), cos = Math.cos(jogadorAngulo);
+    const fx = -sin, fz = -cos;
+    const rx = cos, rz = -sin;
+    let mx = fx*frente + rx*lado;
+    let mz = fz*frente + rz*lado;
+    const len = Math.hypot(mx,mz) || 1;
+    mx/=len; mz/=len;
+
+    const passo = VEL_JOGADOR * dt;
+    const nx = jogadorX + mx*passo;
+    const nz = jogadorZ + mz*passo;
+
+    if (podeAndar(nx, jogadorZ)) jogadorX = nx;
+    if (podeAndar(jogadorX, nz)) jogadorZ = nz;
+  }
+
+  camera.position.set(jogadorX, 1.6, jogadorZ);
+  camera.rotation.order = 'YXZ';
+  camera.rotation.y = jogadorAngulo;
+  camera.rotation.x = jogadorInclinacao;
+}
+
+// ---------- MOEDAS / SAIDA: COLETA ----------
+function atualizarMoedasESaida(dt) {
+  for (let i=moedas.length-1;i>=0;i--){
+    const m = moedas[i];
+    m.rotation.z += dt*2;
+    const dx = jogadorX - m.position.x, dz = jogadorZ - m.position.z;
+    if (Math.hypot(dx,dz) < 0.6) {
+      cena.remove(m);
+      moedas.splice(i,1);
+      pontos += 10;
+      atualizarHUD();
+    }
+  }
+
+  if (saidaMesh) {
+    saidaMesh.rotation.y += dt;
+    const dx = jogadorX - saidaMesh.position.x, dz = jogadorZ - saidaMesh.position.z;
+    if (Math.hypot(dx,dz) < 0.9) {
+      terminarJogo(true);
+    }
+  }
+}
+
+// ---------- HUD / VIDAS / PONTOS ----------
+function atualizarHUD() {
+  document.getElementById('score').textContent = pontos;
+  document.getElementById('lives').textContent = vidas;
+}
+
+function levouHit() {
+  vidas -= 1;
+  semColisaoTempo = 1.5;
+  atualizarHUD();
+  if (vidas <= 0) {
+    terminarJogo(false);
+  } else {
+    // joga o inimigo de volta para o canto inicial (evita pegar de novo na hora)
+    const inicio = { x: TAM-1, y: TAM-1 };
+    inimigo.celula = inicio;
+    const {x,z} = celulaParaMundo(inicio.x, inicio.y);
+    inimigo.mesh.position.set(x,0,z);
+    inimigo.caminho = [];
+  }
+}
+
+function terminarJogo(venceu) {
+  jogoAtivo = false;
+  if (venceu) pontos += 50;
+  document.getElementById('endTitle').textContent = venceu ? 'Você escapou!' : 'O inimigo te pegou!';
+  document.getElementById('finalScore').textContent = pontos;
+  document.getElementById('endScreen').style.display = 'flex';
+}
+
+// ---------- MINIMAPA (vista de cima) ----------
+function desenharMinimapa() {
+  const canvasEl = document.getElementById('minimapa');
+  const ctx = canvasEl.getContext('2d');
+  const W = canvasEl.width, H = canvasEl.height;
+  ctx.clearRect(0,0,W,H);
+  ctx.fillStyle = 'rgba(0,0,0,0.7)';
+  ctx.fillRect(0,0,W,H);
+
+  const escala = W / (TAM*CEL);
+  const meio = (TAM*CEL)/2;
+
+  // desenha as paredes do labirinto
+  ctx.strokeStyle = '#ffffff';
+  ctx.lineWidth = 1.5;
+  for (let y=0;y<TAM;y++){
+    for (let x=0;x<TAM;x++){
+      const celula = labirinto[y][x];
+      const {x:wx,z:wz} = celulaParaMundo(x,y);
+      const px = (wx+meio)*escala, py = (wz+meio)*escala;
+      const metade = (CEL/2)*escala;
+      ctx.beginPath();
+      if (!celula.N){ ctx.moveTo(px-metade,py-metade); ctx.lineTo(px+metade,py-metade); }
+      if (!celula.O){ ctx.moveTo(px-metade,py-metade); ctx.lineTo(px-metade,py+metade); }
+      if (y===TAM-1 && !celula.S){ ctx.moveTo(px-metade,py+metade); ctx.lineTo(px+metade,py+metade); }
+      if (x===TAM-1 && !celula.L){ ctx.moveTo(px+metade,py-metade); ctx.lineTo(px+metade,py+metade); }
+      ctx.stroke();
+    }
+  }
+
+  // saida (quadrado verde)
+  if (saidaMesh) {
+    const ex = (saidaMesh.position.x+meio)*escala, ez = (saidaMesh.position.z+meio)*escala;
+    ctx.fillStyle = '#00ff66';
+    ctx.fillRect(ex-4, ez-4, 8, 8);
+  }
+
+  // inimigo (ponto vermelho)
+  if (inimigo.mesh) {
+    const ix = (inimigo.mesh.position.x+meio)*escala, iz = (inimigo.mesh.position.z+meio)*escala;
+    ctx.fillStyle = '#ff2222';
+    ctx.beginPath(); ctx.arc(ix, iz, 4, 0, Math.PI*2); ctx.fill();
+  }
+
+  // jogador (ponto azul + linha de direcao)
+  const jx = (jogadorX+meio)*escala, jz = (jogadorZ+meio)*escala;
+  ctx.fillStyle = '#33aaff';
+  ctx.beginPath(); ctx.arc(jx, jz, 4, 0, Math.PI*2); ctx.fill();
+  ctx.strokeStyle = '#33aaff';
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(jx, jz);
+  ctx.lineTo(jx - Math.sin(jogadorAngulo)*10, jz - Math.cos(jogadorAngulo)*10);
+  ctx.stroke();
+}
+
+// ---------- LOOP PRINCIPAL ----------
+function iniciar() {
+  cena = new THREE.Scene();
+  cena.background = new THREE.Color(0x111111);
+  cena.fog = new THREE.Fog(0x111111, 4, 16);
+
+  camera = new THREE.PerspectiveCamera(75, window.innerWidth/window.innerHeight, 0.1, 100);
+  renderer = new THREE.WebGLRenderer({ antialias:true });
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  document.body.appendChild(renderer.domElement);
+
+  labirinto = gerarLabirinto(TAM);
+  construirCenario();
+  colocarMoedasESaida();
+  criarInimigo();
+
+  const inicio = celulaParaMundo(0,0);
+  jogadorX = inicio.x; jogadorZ = inicio.z;
+
+  cena.add(camera);
+  configurarControles();
+  window.addEventListener('resize', () => {
+    camera.aspect = window.innerWidth/window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+  });
+
+  relogio = new THREE.Clock();
+  atualizarHUD();
+  loop();
+}
+
+function loop() {
+  requestAnimationFrame(loop);
+  const dt = Math.min(relogio.getDelta(), 0.05);
+  if (jogoAtivo) {
+    if (semColisaoTempo>0) semColisaoTempo -= dt;
+    atualizarJogador(dt);
+    atualizarInimigo(dt);
+    atualizarMoedasESaida(dt);
+    desenharMinimapa();
+  }
+  renderer.render(cena, camera);
+}
+
+iniciar();
+</script>
+</body>
+</html>
